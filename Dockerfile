@@ -14,7 +14,7 @@ RUN make build
 
 # Build WMCB
 WORKDIR /build/wmcb
-RUN tar -zxf /build/wmco/wmcb-4.6-dcb438a.tgz
+RUN tar -zxf /build/wmco/wmcb-4.6-ad544f0-dirty.tgz
 RUN make build
 
 # Build hybrid-overlay
