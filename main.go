@@ -11,6 +11,7 @@ import (
 	"github.com/operator-framework/operator-lib/leader"
 	"github.com/spf13/pflag"
 	"k8s.io/apimachinery/pkg/runtime"
+	kubeTypes "k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
@@ -208,6 +209,12 @@ func main() {
 	// Configure the metric resources
 	if err := metricsConfig.Configure(ctx); err != nil {
 		setupLog.Error(err, "error setting up metrics")
+		os.Exit(1)
+	}
+
+	if err := controllers.EnsureWindowsInstancesConfigMap(setupLog, cfg, watchNamespace); err != nil {
+		setupLog.Error(err, "error ensuring", "singleton", kubeTypes.NamespacedName{Namespace: watchNamespace,
+			Name: controllers.InstanceConfigMap})
 		os.Exit(1)
 	}
 

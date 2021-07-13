@@ -21,11 +21,16 @@ import (
 	"net"
 	"strings"
 
+	"github.com/go-logr/logr"
+	"github.com/openshift/windows-machine-config-operator/pkg/secrets"
+	"github.com/openshift/windows-machine-config-operator/pkg/signer"
 	"github.com/pkg/errors"
 	core "k8s.io/api/core/v1"
 	k8sapierrors "k8s.io/apimachinery/pkg/api/errors"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kubeTypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -40,8 +45,6 @@ import (
 	"github.com/openshift/windows-machine-config-operator/pkg/instances"
 	"github.com/openshift/windows-machine-config-operator/pkg/metrics"
 	"github.com/openshift/windows-machine-config-operator/pkg/nodeconfig"
-	"github.com/openshift/windows-machine-config-operator/pkg/secrets"
-	"github.com/openshift/windows-machine-config-operator/pkg/signer"
 )
 
 //+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
@@ -54,7 +57,6 @@ const (
 	// UsernameAnnotation is a node annotation that contains the username used to log into the Windows instance
 	UsernameAnnotation = "windowsmachineconfig.openshift.io/username"
 	// InstanceConfigMap is the name of the ConfigMap where VMs to be configured should be described.
-	// TODO: Possibly make this a singleton that WMCO creates https://issues.redhat.com/browse/WINC-612
 	InstanceConfigMap = "windows-instances"
 )
 
@@ -96,25 +98,13 @@ func NewConfigMapReconciler(mgr manager.Manager, clusterConfig cluster.Config, w
 func (r *ConfigMapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	_ = r.log.WithValues("configmap", req.NamespacedName)
 
-	var err error
-	// Create a new signer using the private key that the instances will be configured with
-	r.signer, err = signer.Create(kubeTypes.NamespacedName{Namespace: r.watchNamespace,
-		Name: secrets.PrivateKeySecret}, r.client)
-	if err != nil {
-		return ctrl.Result{}, errors.Wrapf(err, "unable to create signer from private key secret")
-	}
-
 	// Fetch the ConfigMap. The predicate will have filtered out any ConfigMaps that we should not reconcile
 	// so it is safe to assume that all ConfigMaps being reconciled describe hosts that need to be present in the
-	// cluster.
-	configMap := &core.ConfigMap{}
-	if err := r.client.Get(ctx, req.NamespacedName, configMap); err != nil {
-		if k8sapierrors.IsNotFound(err) {
-			// Request object not found, could have been deleted after reconcile request.
-			// Owned objects are automatically garbage collected. For additional cleanup logic use finalizers.
-			// Return and don't requeue
-			return ctrl.Result{}, nil
-		}
+	// cluster. This also handles the case when the reconciliation is kicked off by the InstanceConfigMap being deleted.
+	// In the deletion case, an empty InstanceConfigMap will be reconciled now resulting in all existing BYOH nodes
+	// being deleted.
+	configMap, err := r.ensure(context.TODO(), req.NamespacedName)
+	if err != nil {
 		// Error reading the object - requeue the request.
 		return ctrl.Result{}, err
 	}
@@ -164,6 +154,7 @@ func validateAddress(address string) error {
 
 // reconcileNodes corrects the discrepancy between the "expected" hosts slice, and the "actual" nodelist
 func (r *ConfigMapReconciler) reconcileNodes(ctx context.Context, instances *core.ConfigMap) error {
+	var err error
 	// Get the list of instances that are expected to be Nodes
 	hosts, err := r.parseHosts(instances.Data)
 	if err != nil {
@@ -171,8 +162,29 @@ func (r *ConfigMapReconciler) reconcileNodes(ctx context.Context, instances *cor
 	}
 
 	nodes := &core.NodeList{}
+	// Why are we not doing r.client.List(ctx, nodes, []client.ListOption{client.MatchingLabels{core.LabelOSStable: "=windows"}}...)?
 	if err := r.client.List(ctx, nodes); err != nil {
 		return errors.Wrap(err, "error listing nodes")
+	}
+
+	var byohNodes []core.Node
+	for _, node := range nodes.Items {
+		if node.GetAnnotations()[BYOHAnnotation] == "true" {
+			byohNodes = append(byohNodes, node)
+		}
+	}
+
+	// No instances are present in InstanceConfigMap and no Nodes are present in the cluster which implies that we don't
+	// need to do any reconciliation
+	if len(hosts) == 0 && len(byohNodes) == 0 {
+		return nil
+	}
+
+	// Create a new signer using the private key that the instances will be configured with
+	r.signer, err = signer.Create(kubeTypes.NamespacedName{Namespace: r.watchNamespace,
+		Name: secrets.PrivateKeySecret}, r.client)
+	if err != nil {
+		return errors.Wrapf(err, "unable to create signer from private key secret")
 	}
 
 	// For each host, ensure that it is configured into a node. On error of any host joining, return error and requeue.
@@ -282,6 +294,13 @@ func (r *ConfigMapReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			return r.isValidConfigMap(e.ObjectNew)
 		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			// If DeleteStateUnknown is true it implies that the Delete event was missed  and we can ignore it
+			if e.DeleteStateUnknown {
+				return false
+			}
+			return r.isValidConfigMap(e.Object)
+		},
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&core.ConfigMap{}, builder.WithPredicates(configMapPredicate)).
@@ -293,4 +312,57 @@ func (r *ConfigMapReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // isValidConfigMap returns true if the ConfigMap object is the InstanceConfigMap
 func (r *ConfigMapReconciler) isValidConfigMap(o client.Object) bool {
 	return o.GetNamespace() == r.watchNamespace && o.GetName() == InstanceConfigMap
+}
+
+// ensure returns the InstanceConfigMap if present. If it is not present, it creates an empty one and returns
+// it.
+func (r *ConfigMapReconciler) ensure(ctx context.Context, namespacedName kubeTypes.NamespacedName) (
+	*core.ConfigMap, error) {
+	windowsInstances := &core.ConfigMap{}
+	var err error
+	if err = r.client.Get(ctx, namespacedName, windowsInstances); err != nil {
+		if k8sapierrors.IsNotFound(err) {
+			windowsInstances.SetNamespace(namespacedName.Namespace)
+			windowsInstances.SetName(namespacedName.Name)
+			if err = r.client.Create(ctx, windowsInstances); err != nil {
+				return nil, err
+			}
+			r.log.Info("Created", "ConfigMap", namespacedName)
+			if err = r.client.Get(ctx, namespacedName, windowsInstances); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return windowsInstances, err
+}
+
+// EnsureWindowsInstancesConfigMap ensures that the InstanceConfigMap is present on the cluster during operator bootup.
+// ConfigMapReconciler.ensure() cannot be called in its stead as the cache has not been populated yet, which is
+// why the typed client is used here as it calls the API server directly.
+func EnsureWindowsInstancesConfigMap(log logr.Logger, cfg *rest.Config, namespace string) error {
+	if cfg == nil {
+		return errors.New("config should not be nil")
+	}
+
+	var err error
+	k8sClientSet, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return errors.Wrap(err, "error creating config client")
+	}
+
+	windowsInstances := &core.ConfigMap{}
+	if windowsInstances, err = k8sClientSet.CoreV1().ConfigMaps(namespace).Get(context.TODO(), InstanceConfigMap,
+		meta.GetOptions{}); err != nil {
+		if k8sapierrors.IsNotFound(err) {
+			windowsInstances.SetNamespace(namespace)
+			windowsInstances.SetName(InstanceConfigMap)
+			if _, err = k8sClientSet.CoreV1().ConfigMaps(namespace).Create(context.TODO(), windowsInstances,
+				meta.CreateOptions{}); err != nil {
+				return err
+			}
+			log.Info("Created", "ConfigMap", kubeTypes.NamespacedName{Namespace: namespace,
+				Name: InstanceConfigMap})
+		}
+	}
+	return err
 }
